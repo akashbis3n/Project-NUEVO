@@ -26,6 +26,10 @@ services:
     # Arduino UART — RPi GPIO 14/15 (hardware UART).
     devices:
       - /dev/ttyAMA0:/dev/ttyAMA0
+      - /dev/rplidar:/dev/rplidar
+    
+    group_add:
+      - dialout
 
     volumes:
       # ROS workspace source — live from repo (edits take effect on restart).
@@ -43,6 +47,7 @@ services:
       - NUEVO_USERS_FILE=/data/users.json
       - NUEVO_SERIAL_PORT=/dev/ttyAMA0
       - NUEVO_SERIAL_BAUD=200000
+
 
     restart: unless-stopped
 
