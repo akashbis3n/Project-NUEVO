@@ -1,7 +1,7 @@
 """
 test_orientation_fusion.py — complementary-filter orientation test
 ==================================================================
-Drives the robot in a 180-degree semicircle, recording odometry theta and the
+Spins the robot in place through 180 degrees, recording odometry theta and the
 complementary-filter (magnetometer-blended) heading at every tick.
 After the run, matplotlib plots:
   1. Trajectory — x/y path from odometry, coloured by fused-heading drift
@@ -12,8 +12,8 @@ Usage (replace the run() import in main.py, or use the dedicated launch file):
     ros2 launch robot test_orientation_fusion.launch.py
 
 Tuning parameters at the top of this file:
-    CIRCLE_RADIUS_MM  — semicircle radius (mm)
-    DRIVE_SPEED_MM_S  — forward speed (mm/s)
+    SPIN_ANGLE_DEG    — total in-place rotation angle (degrees)
+    ANGULAR_DEG_S     — commanded angular speed (degrees/s)
     FUSION_ALPHA      — complementary-filter mag weight (0 = pure odometry)
 """
 
@@ -33,13 +33,12 @@ from robot.hardware_map import DEFAULT_FSM_HZ
 
 # ── Tunable parameters ────────────────────────────────────────────────────────
 
-CIRCLE_RADIUS_MM  = 300.0    # mm — tighter semicircle stresses heading fusion more
-DRIVE_SPEED_MM_S  = 100.0    # mm/s forward speed
-FUSION_ALPHA      = 1     # complementary-filter magnetometer weight
+SPIN_ANGLE_DEG = 180.0   # degrees — in-place sweep to record heading fusion
+ANGULAR_DEG_S  = 20.0    # deg/s — CCW positive
+FUSION_ALPHA   = 1       # complementary-filter magnetometer weight
 
-# Derived motion command — semicircle is half the full-circle period
-_CIRCLE_PERIOD_S  = 2.0 * math.pi * CIRCLE_RADIUS_MM / DRIVE_SPEED_MM_S
-_ANGULAR_DEG_S    = math.degrees(DRIVE_SPEED_MM_S / CIRCLE_RADIUS_MM)  # CCW positive
+# Derived motion duration for the in-place spin
+_SPIN_DURATION_S = abs(SPIN_ANGLE_DEG / ANGULAR_DEG_S)
 
 # ── Plot output path ──────────────────────────────────────────────────────────
 # /host_home is the host $HOME bind-mounted in docker-compose.rpi.yml.
@@ -85,12 +84,12 @@ class _Record:
 
 
 # =============================================================================
-# Circle drive
+# In-place spin
 # =============================================================================
 
-def _drive_circle(robot: Robot, rec: _Record) -> None:
-    """Command the robot to drive circles and record sensor data."""
-    total_duration = _CIRCLE_PERIOD_S / 2.0  # 180-degree semicircle
+def _spin_in_place(robot: Robot, rec: _Record) -> None:
+    """Command the robot to spin in place and record sensor data."""
+    total_duration = _SPIN_DURATION_S
     period = 1.0 / float(DEFAULT_FSM_HZ)
 
     # ── Prerequisite: bridge must be running ─────────────────────────────────
@@ -147,9 +146,8 @@ def _drive_circle(robot: Robot, rec: _Record) -> None:
     next_tick = t_start
 
     print(
-        f"[fusion_test] Driving 180° semicircle: "
-        f"R={CIRCLE_RADIUS_MM:.0f} mm, v={DRIVE_SPEED_MM_S:.0f} mm/s, "
-        f"ω={_ANGULAR_DEG_S:.1f}°/s, α={FUSION_ALPHA}\n"
+        f"[fusion_test] Spinning in place {SPIN_ANGLE_DEG:.0f}°: "
+        f"v=0.0 mm/s, ω={ANGULAR_DEG_S:.1f}°/s, α={FUSION_ALPHA}\n"
         f"[fusion_test] Expected duration: {total_duration:.1f} s"
     )
 
@@ -164,7 +162,7 @@ def _drive_circle(robot: Robot, rec: _Record) -> None:
         fused_deg = robot.get_fused_orientation() - fused_deg_0
         rec.append(elapsed, x, y, odom_deg, fused_deg)
 
-        robot.set_velocity(DRIVE_SPEED_MM_S, _ANGULAR_DEG_S)
+        robot.set_velocity(0.0, ANGULAR_DEG_S)
 
         next_tick += period
         sleep_s = next_tick - time.monotonic()
@@ -174,7 +172,7 @@ def _drive_circle(robot: Robot, rec: _Record) -> None:
             next_tick = time.monotonic()
 
     robot.stop()
-    print("[fusion_test] Semicircle complete — stopping.")
+    print("[fusion_test] In-place spin complete — stopping.")
 
 
 # =============================================================================
@@ -198,7 +196,7 @@ def _plot_results(rec: _Record) -> None:
     fig, axes = plt.subplots(1, 3, figsize=(15, 5))
     fig.suptitle(
         f"Complementary-filter fusion test  "
-        f"(α={FUSION_ALPHA}, R={CIRCLE_RADIUS_MM:.0f} mm, 180° semicircle)",
+        f"(α={FUSION_ALPHA}, {SPIN_ANGLE_DEG:.0f}° in-place spin)",
         fontsize=12,
     )
 
@@ -259,7 +257,7 @@ def run(robot: Robot) -> None:
     robot.set_fusion_alpha(FUSION_ALPHA)
 
     rec = _Record()
-    _drive_circle(robot, rec)
+    _spin_in_place(robot, rec)
     _plot_results(rec)
 
 
