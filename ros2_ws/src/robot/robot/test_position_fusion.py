@@ -4,9 +4,14 @@ test_position_fusion.py — GPS-anchored position fusion alpha-tuning test
 Purpose
 -------
 Helps students tune ``POS_FUSION_ALPHA`` by driving the robot in a straight
-line along the world +Y axis (the robot's initial forward direction) between
-two marked spots on the floor, both within the GPS (overhead camera) coverage
-area.
+line along the robot's initial forward direction between two marked spots on
+the floor.
+
+The test does not assume the robot starts at the GPS/world origin. Instead,
+when GPS is first acquired it records the current odometry position and uses
+that as the translation offset for the GPS frame. After that, the fused
+position behaves in the robot's odometry/world frame and students can tune
+``POS_FUSION_ALPHA`` directly against the marked travel distance.
 
 Setup
 -----
@@ -15,29 +20,24 @@ Setup
 2. Mark the destination spot with an X.
 3. Run the test.  The robot drives to the second spot and stops.
 4. Check the plots:
-   - **Y position over time** — how closely the fused estimate tracks the
-     target distance.  Odometry and fused should both reach DRIVE_DISTANCE_MM;
-     if fused drifts away from the target line the alpha is too low (GPS not
-     pulling enough) or the GPS coverage has a gap.
-   - **X drift over time** — ideally stays near zero.  A large X drift means
-     the robot veered; fused X should correct back toward zero when GPS is
-     active.
-   - **2D bird's-eye trajectory** — the ideal path is a vertical line at X = 0.
-     Deviation shows steering error; the fused path should stay tighter to the
+   - **Forward progress over time** — how closely the fused estimate tracks the
+     target distance. If fused progress drifts away from the target line the
+     alpha is too low (GPS not pulling enough) or GPS coverage has a gap.
+   - **Lateral drift over time** — ideally stays near zero.  A large lateral
+     drift means the robot veered; fused drift should correct back toward zero
+     when GPS is active.
+   - **2D bird's-eye trajectory** — the ideal path is a straight line from the
+     start marker to the end marker. The fused path should stay tighter to the
      ideal than raw odometry when GPS is active.
    - **Fused − odometry error** — shaded green when GPS is active; error
      magnitude should rise when GPS drops out and shrink when it returns.
 
 Tuning guide
 ------------
-* If the fused path overshoots or oscillates around the GPS fix → lower alpha.
+* If the fused path overshoots or oscillates around the corrected position → lower alpha.
 * If the fused path lags odometry and never fully corrects to the marker → raise alpha.
 * A good starting point is alpha = 0.3–0.5 for 10 Hz GPS; alpha = 1.0 snaps
   directly to GPS each kinematics tick (useful to verify GPS accuracy in isolation).
-
-The GPS offset must be set before running if the GPS frame origin does not
-coincide with the robot start corner.  Edit GPS_OFFSET_X_MM / GPS_OFFSET_Y_MM
-below once the offset has been measured.
 
 Usage:
     ros2 launch robot test_position_fusion.launch.py
@@ -60,15 +60,9 @@ from robot.hardware_map import DEFAULT_FSM_HZ
 
 # ── Tunable parameters ────────────────────────────────────────────────────────
 
-DRIVE_DISTANCE_MM = 1000.0    # mm — distance between the two marked spots along world +Y
+DRIVE_DISTANCE_MM = 1000.0    # mm — distance between the two marked spots along the robot's initial forward axis
 DRIVE_SPEED_MM_S  = 100.0    # mm/s forward speed
 POS_FUSION_ALPHA  = 0.3       # GPS weight for complementary filter (0–1); tune this
-
-# GPS frame → arena frame offset (mm).
-# Set these to the measured offset once calibrated; leave at 0 to trigger the
-# "offset not configured" warning and test uncompensated behaviour.
-GPS_OFFSET_X_MM   = 609.6
-GPS_OFFSET_Y_MM   = -304.8
 
 # ── Plot output path ──────────────────────────────────────────────────────────
 # /host_home is the host $HOME bind-mounted in docker-compose.rpi.yml.
@@ -175,12 +169,15 @@ def _drive_straight(robot: Robot, rec: _Record) -> None:
     next_tick = t_start
     odom_x = odom_x0
     odom_y = odom_y0
+    gps_aligned = False
 
     print(
-        f"[pos_fusion_test] Driving +Y {DRIVE_DISTANCE_MM:.0f} mm "
+        f"[pos_fusion_test] Driving forward {DRIVE_DISTANCE_MM:.0f} mm "
         f"at {DRIVE_SPEED_MM_S:.0f} mm/s  alpha={POS_FUSION_ALPHA}\n"
-        f"[pos_fusion_test] GPS offset: ({GPS_OFFSET_X_MM:.1f}, {GPS_OFFSET_Y_MM:.1f}) mm\n"
-        f"[pos_fusion_test] Place start marker at robot origin, end marker {DRIVE_DISTANCE_MM:.0f} mm forward."
+        f"[pos_fusion_test] GPS frame will be translated to match odometry "
+        f"at first acquisition.\n"
+        f"[pos_fusion_test] Place start marker at robot origin, end marker "
+        f"{DRIVE_DISTANCE_MM:.0f} mm forward."
     )
 
     while True:
@@ -189,9 +186,27 @@ def _drive_straight(robot: Robot, rec: _Record) -> None:
         # Raw odometry (private, accessed here for diagnostic purposes only)
         with robot._lock:
             odom_x, odom_y, _ = robot._pose
+            gps_x_mm = robot._gps_x_mm
+            gps_y_mm = robot._gps_y_mm
+
+        gps_on = robot.is_gps_active()
+        if gps_on and not gps_aligned:
+            # Align the GPS frame translation to the odometry/world frame
+            # the moment GPS first becomes available.
+            learned_offset_x = odom_x - gps_x_mm
+            learned_offset_y = odom_y - gps_y_mm
+            robot.set_gps_offset(learned_offset_x, learned_offset_y)
+            gps_aligned = True
+            print(
+                f"[pos_fusion_test] GPS acquired — learned offset "
+                f"({learned_offset_x:.1f}, {learned_offset_y:.1f}) mm "
+                f"from odometry at first sight."
+            )
+            # Wait for the next tag update so the new offset is reflected in
+            # the internal GPS state before recording/using fused position.
+            continue
 
         fused_x_mm, fused_y_mm, _ = robot._get_pose_mm()
-        gps_on = robot.is_gps_active()
 
         elapsed = time.monotonic() - t_start
         # Record relative to starting position so plots start at (0, 0).
@@ -269,21 +284,20 @@ def _plot_results(rec: _Record) -> None:
     )
     gps_patch = mpatches.Patch(color="green", alpha=0.3, label="GPS active")
 
-    # ── Panel 1 (top-left): Y progress — primary tuning view ─────────────────
-    # Driving in world +Y: this is the axis of intended motion.
+    # ── Panel 1 (top-left): Forward progress — primary tuning view ───────────
     _shade_gps_regions(ax_y, t, gps_active)
     ax_y.plot(t, odom_y,  lw=1.2, color="steelblue", label="Odometry Y")
     ax_y.plot(t, fused_y, lw=1.5, color="tomato",    linestyle="--", label="Fused Y")
     ax_y.axhline(DRIVE_DISTANCE_MM, color="black", lw=1.0, linestyle=":",
                  label=f"Target ({DRIVE_DISTANCE_MM:.0f} mm)")
     ax_y.set_xlabel("time (s)")
-    ax_y.set_ylabel("Y position (mm)")
-    ax_y.set_title("Y progress toward target (primary)")
+    ax_y.set_ylabel("Forward progress (mm)")
+    ax_y.set_title("Forward progress toward target (primary)")
     ax_y.legend(handles=[*ax_y.get_legend_handles_labels()[0], gps_patch], fontsize=8)
     ax_y.grid(True, alpha=0.3)
 
     # ── Panel 2 (top-right): 2D bird's-eye trajectory ─────────────────────────
-    # Ideal path is a vertical line at X = 0.
+    # Ideal path is a straight line from the start marker to the end marker.
     x_range = max(np.abs(odom_x).max(), np.abs(fused_x).max(), 50.0)
     ax_traj.axvline(0.0, color="black", lw=1.0, linestyle=":", label="Ideal path (X=0)")
     ax_traj.plot(odom_x,  odom_y,  lw=1.2, color="steelblue", label="Odometry path")
@@ -301,14 +315,14 @@ def _plot_results(rec: _Record) -> None:
     ax_traj.legend(fontsize=7)
     ax_traj.grid(True, alpha=0.3)
 
-    # ── Panel 3 (bottom-left): X drift — should stay near zero ───────────────
+    # ── Panel 3 (bottom-left): Lateral drift — should stay near zero ─────────
     _shade_gps_regions(ax_x, t, gps_active)
     ax_x.axhline(0.0, color="black", lw=0.8, linestyle=":")
     ax_x.plot(t, odom_x,  lw=1.2, color="steelblue", label="Odometry X")
     ax_x.plot(t, fused_x, lw=1.5, color="tomato",    linestyle="--", label="Fused X")
     ax_x.set_xlabel("time (s)")
-    ax_x.set_ylabel("X drift (mm)")
-    ax_x.set_title("X drift (should stay ≈ 0)")
+    ax_x.set_ylabel("Lateral drift (mm)")
+    ax_x.set_title("Lateral drift (should stay ≈ 0)")
     ax_x.legend(handles=[*ax_x.get_legend_handles_labels()[0][:2], gps_patch], fontsize=8)
     ax_x.grid(True, alpha=0.3)
 
@@ -339,7 +353,9 @@ def _plot_results(rec: _Record) -> None:
 # =============================================================================
 
 def run(robot: Robot) -> None:
-    robot.set_gps_offset(GPS_OFFSET_X_MM, GPS_OFFSET_Y_MM)
+    # Start with zero translation; the test learns the GPS→odom offset when
+    # the robot first enters GPS view.
+    robot.set_gps_offset(0.0, 0.0)
     robot.set_pos_fusion_alpha(POS_FUSION_ALPHA)
 
     rec = _Record()
